@@ -43,8 +43,8 @@ if (WIN32)
   set(CMAKE_DXC_COMPILER "${CMAKE_BINARY_DIR}/dxc_2023_08_14/bin/x64/dxc.exe" CACHE INTERNAL "CMAKE_DXC_COMPILER")
 else() # linux
   FetchContent_Declare(HLSLCompiler
-    URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.7.2308/linux_dxc_2023_08_14.x86_64.tar.gz
-    URL_HASH SHA256=4fad86d15a5a68c9063a272af069dc40b7a24c325f665f474ed2dbd8623f7448
+    URL https://github.com/wilsonCernWq/GPRT/releases/download/ovr-dxc/linux_dxc_2023_08_14.x86_64.tar.gz
+    URL_HASH SHA256=93b773f23be32b28b2cb108028cc50d85ace5b6b9a4c30a16a35f4c1a1b200f2
     DOWNLOAD_NO_EXTRACT true
     DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/"
   )
