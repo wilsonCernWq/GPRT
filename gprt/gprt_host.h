@@ -50,6 +50,7 @@ using namespace linalg::ostream_overloads;
 #include <type_traits>
 #include <iostream>
 #include <cstdlib>
+#include <string>
 
 #ifdef __cplusplus
 #include <cstddef>
@@ -94,6 +95,8 @@ using namespace linalg::ostream_overloads;
 #define GPRT_TERMINAL_LIGHT_MAGENTA "\e[95m"
 #define GPRT_TERMINAL_CYAN          "\e[36m"
 #define GPRT_TERMINAL_LIGHT_RED     "\033[1;31m"
+
+#define GPRT_TO_STRING(x) #x
 
 using GPRTContext = struct _GPRTContext *;
 using GPRTModule = struct _GPRTModule *;
@@ -1854,7 +1857,7 @@ gprtRayGenLaunch3D(GPRTContext context, GPRTRayGenOf<RecordType> rayGen, uint32_
 template <typename RecordType, typename PushConstantsType>
 void
 gprtRayGenLaunch3D(GPRTContext context, GPRTRayGenOf<RecordType> rayGen, uint32_t dims_x, uint32_t dims_y, uint32_t dims_z, PushConstantsType pushConstants) {
-  static_assert(sizeof(PushConstantsType) <= PUSH_CONSTANTS_LIMIT, "Current GPRT push constant size limited to " + PUSH_CONSTANTS_LIMIT + " bytes or less");
+  static_assert(sizeof(PushConstantsType) <= PUSH_CONSTANTS_LIMIT, "Current GPRT push constant size limited to " GPRT_TO_STRING(PUSH_CONSTANTS_LIMIT) " bytes or less");
   gprtRayGenLaunch3D(context, (GPRTRayGen) rayGen, dims_x, dims_y, dims_z, sizeof(PushConstantsType), &pushConstants);
 }
 
