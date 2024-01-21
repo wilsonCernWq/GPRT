@@ -47,6 +47,16 @@ else ()
         message("Done.")
     endif()
     set(CMAKE_SLANG_COMPILER "${CMAKE_BINARY_DIR}/slang-2023.5.4-win64/bin/windows-x64/release/slangc.exe" CACHE INTERNAL "CMAKE_SLANG_COMPILER")
+  elseif(APPLE)
+    # set(ver 2023.4.9)
+    # FetchContent_Declare(HLSLCompiler
+    #   URL https://github.com/shader-slang/slang/releases/download/v${ver}/slang-${ver}-macos-aarch64.zip
+    #   DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/"
+    #   SOURCE_DIR "${CMAKE_BINARY_DIR}/slang-${ver}-macos-aarch64"
+    # )
+    # FetchContent_Populate(HLSLCompiler)
+    # execute_process(COMMAND chmod +x "${CMAKE_BINARY_DIR}/slang-${ver}-macos-aarch64/bin/macosx-aarch64/release/slangc")
+    set(CMAKE_SLANG_COMPILER "/Users/qwu/Work/projects/slang/bin/macosx-aarch64/release/slangc" CACHE INTERNAL "CMAKE_SLANG_COMPILER")
   else() # linux
     FetchContent_Declare(HLSLCompiler
       URL https://github.com/shader-slang/slang/releases/download/v2023.5.4/slang-2023.5.4-linux-x86_64.tar.gz
@@ -89,7 +99,6 @@ function(embed_devicecode)
   unset(EMBED_DEVICECODE_OUTPUTS)
 
   add_custom_command(
-  # add_custom_target(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${EMBED_DEVICECODE_OUTPUT_TARGET}.spv
     COMMAND ${CMAKE_SLANG_COMPILER}
     ${EMBED_DEVICECODE_SOURCES}
