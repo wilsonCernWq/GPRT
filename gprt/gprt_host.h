@@ -108,12 +108,14 @@ using GPRTGeom = struct _GPRTGeom *;
 using GPRTGeomType = struct _GPRTGeomType *;
 using GPRTRayGen = struct _GPRTRayGen *;
 using GPRTMiss = struct _GPRTMiss *;
+using GPRTCallable = struct _GPRTCallable *;
 using GPRTCompute = struct _GPRTCompute *;
 
 template <typename T> struct _GPRTBufferOf;
 template <typename T> struct _GPRTTextureOf;
 template <typename T> struct _GPRTRayGenOf;
 template <typename T> struct _GPRTMissOf;
+template <typename T> struct _GPRTCallableOf;
 template <typename ...T> struct _GPRTComputeOf;
 template <typename T> struct _GPRTGeomOf;
 template <typename T> struct _GPRTGeomTypeOf;
@@ -121,6 +123,7 @@ template <typename T> using GPRTRayGenOf = struct _GPRTRayGenOf<T> *;
 template <typename T> using GPRTBufferOf = struct _GPRTBufferOf<T> *;
 template <typename T> using GPRTTextureOf = struct _GPRTTextureOf<T> *;
 template <typename T> using GPRTMissOf = struct _GPRTMissOf<T> *;
+template <typename T> using GPRTCallableOf = struct _GPRTCallableOf<T> *;
 template <typename ...T> using GPRTComputeOf = struct _GPRTComputeOf<T...> *;
 template <typename T> using GPRTGeomOf = struct _GPRTGeomOf<T> *;
 template <typename T> using GPRTGeomTypeOf = struct _GPRTGeomTypeOf<T> *;
@@ -151,9 +154,6 @@ constexpr size_t totalSizeOf() {
     return (sizeof(Args) + ... + 0);
 }
 
-template<typename T, typename... Args>
-struct are_all_same : std::bool_constant<(std::is_same_v<T, Args> && ...)> {};
-
 /*! launch params (or "globals") are variables that can be put into
   device constant memory, accessible through Vulkan's push constants */
 typedef struct _GPRTLaunchParams *GPRTLaunchParams, *GPRTParams, *GPRTGlobals;
@@ -163,9 +163,10 @@ typedef enum {
   GPRT_SBT_GEOM = GPRT_SBT_HITGROUP,
   GPRT_SBT_RAYGEN = 2,
   GPRT_SBT_MISS = 4,
-  GPRT_SBT_COMPUTE = 8,
-  GPRT_SBT_RASTER = 16,
-  GPRT_SBT_ALL = 31
+  GPRT_SBT_CALLABLE = 8,
+  GPRT_SBT_COMPUTE = 16,
+  GPRT_SBT_RASTER = 32,
+  GPRT_SBT_ALL = 63
 } GPRTBuildSBTFlags;
 
 /*! enum that specifies the different possible memory layouts for
@@ -597,10 +598,18 @@ gprtGuiSetRasterAttachments(GPRTContext context, GPRTTextureOf<T1> colorAttachme
  */
 GPRT_API void gprtGuiRasterize(GPRTContext context);
 
+/*! Requests the given size (in bytes) to reserve for parameters 
+  of ray tracing programs. Defaults to 256 bytes */
+GPRT_API void gprtRequestRecordSize(uint32_t recordSize);
+
 /*! set number of ray types to be used; this should be
   done before any programs, pipelines, geometries, etc get
   created */
 GPRT_API void gprtRequestRayTypeCount(uint32_t numRayTypes);
+
+/*! set maximum recursion depth available in a ray tracing pipeline.
+ Currently defaults to 31. */
+GPRT_API void gprtRequestRayRecursionDepth(uint32_t rayRecursionDepth);
 
 /*! Requests that ray queries be enabled for inline ray tracing support. */
 GPRT_API void gprtRequestRayQueries();
@@ -689,6 +698,10 @@ gprtRayGenCreate(GPRTContext context, GPRTModule module, const char *entrypoint)
   return (GPRTRayGenOf<T>) gprtRayGenCreate(context, module, entrypoint, sizeof(T));
 }
 
+// Specialization for void
+template <>
+GPRTRayGenOf<void> gprtRayGenCreate<void>(GPRTContext context, GPRTModule module, const char *entrypoint);
+
 GPRT_API void gprtRayGenDestroy(GPRTRayGen rayGen);
 
 template <typename T>
@@ -776,6 +789,10 @@ gprtMissCreate(GPRTContext context, GPRTModule module, const char *entrypoint) {
   return (GPRTMissOf<T>) gprtMissCreate(context, module, entrypoint, sizeof(T));
 }
 
+// Specialization for void
+template <>
+GPRTMissOf<void> gprtMissCreate<void>(GPRTContext context, GPRTModule module, const char *entrypoint);
+
 GPRT_API void gprtMissSet(GPRTContext context, int rayType, GPRTMiss missProgToUse);
 
 template <typename T>
@@ -839,6 +856,43 @@ template <typename T>
 void
 gprtMissSetParameters(GPRTMissOf<T> miss, T *parameters, int deviceID GPRT_IF_CPP(= 0)) {
   gprtMissSetParameters((GPRTMiss) miss, (void *) parameters, deviceID);
+}
+
+GPRT_API GPRTCallable gprtCallableCreate(GPRTContext context, GPRTModule module, const char *entrypoint, size_t recordSize);
+
+template <typename T>
+GPRTCallableOf<T>
+gprtCallableCreate(GPRTContext context, GPRTModule module, const char *entrypoint) {
+  return (GPRTCallableOf<T>) gprtCallableCreate(context, module, entrypoint, sizeof(T));
+}
+
+// Specialization for void
+template <>
+GPRTCallableOf<void> gprtCallableCreate<void>(GPRTContext context, GPRTModule module, const char *entrypoint);
+
+GPRT_API void gprtCallableDestroy(GPRTCallable callableProg);
+
+template <typename T>
+void
+gprtCallableDestroy(GPRTCallableOf<T> callableProg) {
+  gprtCallableDestroy((GPRTCallable) callableProg);
+}
+
+GPRT_API void *gprtCallableGetParameters(GPRTCallable callableProg, int deviceID GPRT_IF_CPP(= 0));
+
+
+template <typename T>
+T *
+gprtCallableGetParameters(GPRTCallableOf<T> callableProg, int deviceID GPRT_IF_CPP(= 0)) {
+  return (T *) gprtCallableGetParameters((GPRTCallable) callableProg, deviceID);
+}
+
+GPRT_API void gprtCallableSetParameters(GPRTCallable callable, void *parameters, int deviceID GPRT_IF_CPP(= 0));
+
+template <typename T>
+void
+gprtCallableSetParameters(GPRTCallableOf<T> callable, T *parameters, int deviceID GPRT_IF_CPP(= 0)) {
+  gprtCallableSetParameters((GPRTCallable) callable, (void *) parameters, deviceID);
 }
 
 // ------------------------------------------------------------------
@@ -1862,17 +1916,18 @@ gprtRayGenLaunch3D(GPRTContext context, GPRTRayGenOf<RecordType> rayGen, uint32_
 }
 
 // declaration for internal implementation
-void _gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTCompute compute, std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants);
+void _gprtComputeLaunch(GPRTCompute compute, std::array<size_t, 3> numGroups, std::array<size_t, 3> groupSize, std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants);
 
-// Case where compute program uniforms are non-type-safe
-template<size_t numThreadsX, size_t numThreadsY, size_t numThreadsZ, typename... Uniforms>
-void gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTCompute compute, Uniforms... uniforms) {
+// Case where compute program uniforms are not known at compilation time
+template<typename... Uniforms>
+void gprtComputeLaunch(GPRTCompute compute, std::array<size_t, 3> numGroups, std::array<size_t, 3> groupSize, Uniforms... uniforms) {
   static_assert(totalSizeOf<Uniforms...>() <= PUSH_CONSTANTS_LIMIT, "Total size of arguments exceeds PUSH_CONSTANTS_LIMIT bytes");
-  static_assert(numThreadsX * numThreadsY * numThreadsX <= THREADGROUP_LIMIT, 
-    "Thread count per group exceeds THREADGROUP_LIMIT. Reduce thread count and increase workgroup number.");
 
   runtime_assert(numGroups[0] <= WORKGROUP_LIMIT && numGroups[1] <= WORKGROUP_LIMIT && numGroups[2] <= WORKGROUP_LIMIT, 
     "Workgroup count exceeds WORKGROUP_LIMIT. Increase numthreads and reduce the number of workgroups.");
+  
+  runtime_assert(groupSize[0] * groupSize[1] * groupSize[2] <= THREADGROUP_LIMIT, 
+    "Thread count per group exceeds THREADGROUP_LIMIT. Reduce thread count and increase workgroup number.");
 
   std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants{}; // Initialize with zero
   size_t offset = 0;
@@ -1880,18 +1935,19 @@ void gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTCompute compute, Uni
   // Serialize each argument into the buffer
   (handleArg(pushConstants, offset, uniforms), ...);
 
-  _gprtComputeLaunch(numGroups, compute, pushConstants);
+  _gprtComputeLaunch(compute, numGroups, groupSize, pushConstants);
 }
 
-// Case where compute program has type-safe uniform arguments
-template<size_t numThreadsX, size_t numThreadsY, size_t numThreadsZ, typename... Uniforms, typename = std::enable_if_t<are_all_same<Uniforms...>::value>>
-void gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTComputeOf<Uniforms...> compute, Uniforms... uniforms) {
+// Case where compute program has compile-time type-safe uniform arguments
+template<typename... Uniforms>
+void gprtComputeLaunch(GPRTComputeOf<Uniforms...> compute, std::array<size_t, 3> numGroups, std::array<size_t, 3> groupSize, Uniforms... uniforms) {
   static_assert(totalSizeOf<Uniforms...>() <= PUSH_CONSTANTS_LIMIT, "Total size of arguments exceeds PUSH_CONSTANTS_LIMIT bytes");
-  static_assert(numThreadsX * numThreadsY * numThreadsZ <= THREADGROUP_LIMIT, 
-    "Thread count per group exceeds THREADGROUP_LIMIT. Reduce thread count and increase workgroup number.");
-
+  
   runtime_assert(numGroups[0] <= WORKGROUP_LIMIT && numGroups[1] <= WORKGROUP_LIMIT && numGroups[2] <= WORKGROUP_LIMIT, 
     "Workgroup count exceeds WORKGROUP_LIMIT. Increase numthreads and reduce the number of workgroups.");
+  
+  runtime_assert(groupSize[0] * groupSize[1] * groupSize[2] <= THREADGROUP_LIMIT, 
+    "Thread count per group exceeds THREADGROUP_LIMIT. Reduce thread count and increase workgroup number.");
 
   std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants{}; // Initialize with zero
   size_t offset = 0;
@@ -1899,7 +1955,7 @@ void gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTComputeOf<Uniforms..
   // Serialize each argument into the buffer
   (handleArg(pushConstants, offset, uniforms), ...);
 
-  _gprtComputeLaunch(numGroups, (GPRTCompute)compute, pushConstants);
+  _gprtComputeLaunch((GPRTCompute)compute, numGroups, groupSize, pushConstants);
 }
 
 GPRT_API void gprtBeginProfile(GPRTContext context);

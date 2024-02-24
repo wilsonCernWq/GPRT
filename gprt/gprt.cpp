@@ -57,6 +57,9 @@
 // library for windowing
 #include <GLFW/glfw3.h>
 
+// For SPIRV reflection
+#include "spirv_reflect.h"
+
 // library for image output
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -89,6 +92,11 @@ static struct RequestedFeatures {
   } windowProperties;
 
   uint32_t numRayTypes = 1;
+
+  // On AMD, might require RADV driver...
+  uint32_t rayRecursionDepth = 31;
+
+  uint32_t recordSize = 256;
 
   /** Ray queries enable inline ray tracing.
    * Not supported by some platforms like the A100, so requesting is important. */
@@ -323,12 +331,77 @@ struct Stage {
 };
 
 struct Module {
+  spv_reflect::ShaderModule shaderModule;
   std::vector<uint32_t> binary;
 
-  Module(GPRTProgram program) { 
+  struct DescriptorBinding {
+    uint32_t bindingNumber;
+    std::string variableName;
+    SpvReflectDescriptorType type;
+    uint32_t count;
+  };
+
+  struct DescriptorSet {
+    uint32_t setNumber;
+    uint32_t bindingCount;
+    std::map<uint32_t, DescriptorBinding> bindings;
+  };
+
+  struct EntryPoint {
+    std::string name;
+    uint32_t descriptorSetCount;
+    std::map<uint32_t, DescriptorSet> descriptorSets;
+  };
+
+  std::map<std::string, EntryPoint> EntryPoints;
+  std::vector<std::string> EntryPointNames;
+  
+  Module(GPRTProgram program) {
     size_t sizeOfProgram = program.size();
     binary.resize(sizeOfProgram / 4);
     memcpy(binary.data(), program.data(), sizeOfProgram);
+    
+    shaderModule = spv_reflect::ShaderModule(program.size(), program.data(), SPV_REFLECT_MODULE_FLAG_NONE);
+
+    // Enumerate entry points
+    uint32_t numEntryPoints = shaderModule.GetEntryPointCount();
+    for (uint32_t eid = 0; eid < numEntryPoints; ++eid) {
+      std::string entrypointName = std::string(shaderModule.GetEntryPointName(eid));        
+      EntryPoint entry = {};
+      entry.name = entrypointName;
+      
+      // Enumerate descriptor sets for the given entry point
+      shaderModule.EnumerateEntryPointDescriptorSets(entrypointName.c_str(), &entry.descriptorSetCount, nullptr);
+      std::vector<SpvReflectDescriptorSet*> descriptorSets(entry.descriptorSetCount);
+      shaderModule.EnumerateEntryPointDescriptorSets(entrypointName.c_str(), &entry.descriptorSetCount, descriptorSets.data());
+      for (uint32_t did = 0; did < entry.descriptorSetCount; ++did) {
+        DescriptorSet descriptorSet = {};
+        descriptorSet.setNumber = descriptorSets[did]->set;
+        
+        // Enumerate bindings for the given descriptor set and entry point
+        shaderModule.EnumerateEntryPointDescriptorBindings(entrypointName.c_str(), &descriptorSet.bindingCount, nullptr);
+        std::vector<SpvReflectDescriptorBinding*> bindings(descriptorSet.bindingCount);
+        shaderModule.EnumerateEntryPointDescriptorBindings(entrypointName.c_str(), &descriptorSet.bindingCount, bindings.data());
+
+        for (uint32_t bid = 0; bid < descriptorSet.bindingCount; ++bid) {
+          DescriptorBinding binding = {};
+          binding.bindingNumber = bindings[bid]->binding;
+          binding.type = bindings[bid]->descriptor_type;
+          binding.count = bindings[bid]->count;
+          binding.variableName = std::string(bindings[bid]->name);
+          descriptorSet.bindings[binding.bindingNumber] = binding;
+        }
+
+        entry.descriptorSets[descriptorSet.setNumber] = descriptorSet;
+      }
+
+      EntryPoints[entrypointName] = entry;
+      EntryPointNames.push_back(entrypointName);
+    }
+  }
+
+  bool checkForEntrypoint(const char* entrypoint) {
+    return EntryPoints.find(entrypoint) != EntryPoints.end();
   }
 
   ~Module() {}
@@ -2016,6 +2089,68 @@ struct Miss : public SBTEntry {
 
 std::vector<Miss *> Miss::misses;
 
+struct Callable : public SBTEntry {
+  // Our own virtual "callable address space".
+  uint32_t address = -1;
+  static std::vector<Callable *> callables;
+
+  VkShaderModule shaderModule;
+  VkPipelineShaderStageCreateInfo shaderStage{};
+  VkShaderModuleCreateInfo moduleCreateInfo{};
+  VkDevice logicalDevice;
+  std::string entryPoint;
+
+  Callable(VkDevice _logicalDevice, Module *module, const char *_entryPoint, size_t recordSize) : SBTEntry() {
+    // Hunt for an existing free address for this callable kernel
+    for (uint32_t i = 0; i < Callable::callables.size(); ++i) {
+      if (Callable::callables[i] == nullptr) {
+        Callable::callables[i] = this;
+        address = i;
+        break;
+      }
+    }
+    // If we cant find a free spot in the current list, allocate a new one
+    if (address == -1) {
+      Callable::callables.push_back(this);
+      address = (uint32_t)Callable::callables.size() - 1;
+    }
+
+    // Fetch the SPIRV
+    std::vector<unsigned int, std::allocator<unsigned int>> binary;
+
+    entryPoint = std::string(_entryPoint);      
+    binary = module->binary;
+    
+    // store a reference to the logical device this module is made on
+    logicalDevice = _logicalDevice;
+
+    moduleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleCreateInfo.codeSize = binary.size() * sizeof(uint32_t);   // sizeOfProgramBytes;
+    moduleCreateInfo.pCode = binary.data();                         //(uint32_t*)binary->wordCount;//programBytes;
+
+    VK_CHECK_RESULT(vkCreateShaderModule(logicalDevice, &moduleCreateInfo, NULL, &shaderModule));
+
+    shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStage.stage = VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+    shaderStage.module = shaderModule;
+    shaderStage.pName = entryPoint.c_str();
+    assert(shaderStage.module != VK_NULL_HANDLE);
+
+    this->recordSize = recordSize;
+    this->SBTRecord = (uint8_t *) malloc(recordSize);
+  }
+  ~Callable() {}
+  void destroy() {
+    // Free callable slot for use by subsequently made callable kernels
+    Callable::callables[address] = nullptr;
+
+    vkDestroyShaderModule(logicalDevice, shaderModule, nullptr);
+    free(this->SBTRecord);
+  }
+};
+
+std::vector<Callable *> Callable::callables;
+
 /* An abstraction for any sort of geometry type - describes the
     programs to use, and structure of the SBT records, when building
     shader binding tables (SBTs) with geometries of this type. This
@@ -2792,6 +2927,7 @@ struct Context {
 
   std::vector<RayGen *> raygenPrograms;
   std::vector<Miss *> missPrograms;
+  std::vector<Callable *> callablePrograms;
 
   bool computePipelinesOutOfDate = true;
   bool rasterPipelinesOutOfDate = true;
@@ -2846,6 +2982,7 @@ struct Context {
   std::vector<VkRayTracingShaderGroupCreateInfoKHR> shaderGroups{};
   Buffer *raygenTable = nullptr;
   Buffer *missTable = nullptr;
+  Buffer *callableTable = nullptr;
   Buffer *hitgroupTable = nullptr;
 
   std::map<std::string, Compute*> internalComputePrograms;
@@ -3934,6 +4071,11 @@ struct Context {
       delete missTable;
       missTable = nullptr;
     }
+    if (callableTable) {
+      callableTable->destroy();
+      delete callableTable;
+      callableTable = nullptr;
+    }
     if (hitgroupTable) {
       hitgroupTable->destroy();
       delete hitgroupTable;
@@ -4592,69 +4734,6 @@ struct Context {
 
     // Record dear imgui primitives into command buffer
     ImGui_ImplVulkan_RenderDrawData(draw_data, graphicsCommandBuffer);
-
-    // if (imgui.pipeline == VK_NULL_HANDLE) {
-    //   geometryType->buildRasterPipeline(rasterType, samplerDescriptorSetLayout, texture1DDescriptorSetLayout,
-    //                                     texture2DDescriptorSetLayout, texture3DDescriptorSetLayout,
-    //                                     rasterRecordDescriptorSetLayout);
-    // }
-
-    // // Bind the rendering pipeline
-    // // todo, if pipeline doesn't exist, create it.
-    // vkCmdBindPipeline(graphicsCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-    //                   geometryType->raster[rasterType].pipeline);
-
-    // VkViewport viewport{};
-    // viewport.x = 0.0f;
-    // viewport.y = 0.0f;
-    // viewport.width = static_cast<float>(geometryType->raster[rasterType].width);
-    // viewport.height = static_cast<float>(geometryType->raster[rasterType].height);
-    // viewport.minDepth = 0.0f;
-    // viewport.maxDepth = 1.0f;
-    // vkCmdSetViewport(graphicsCommandBuffer, 0, 1, &viewport);
-
-    // VkRect2D scissor{};
-    // scissor.offset = {0, 0};
-    // scissor.extent.width = geometryType->raster[rasterType].width;
-    // scissor.extent.height = geometryType->raster[rasterType].height;
-    // vkCmdSetScissor(graphicsCommandBuffer, 0, 1, &scissor);
-
-    // auto alignedSize = [](uint32_t value, uint32_t alignment) -> uint32_t {
-    //   return (value + alignment - 1) & ~(alignment - 1);
-    // };
-
-    // const uint32_t handleSize = rayTracingPipelineProperties.shaderGroupHandleSize;
-    // const uint32_t maxGroupSize = rayTracingPipelineProperties.maxShaderGroupStride;
-    // const uint32_t groupAlignment = rayTracingPipelineProperties.shaderGroupHandleAlignment;
-    // const uint32_t maxShaderRecordStride = rayTracingPipelineProperties.maxShaderGroupStride;
-
-    // // for the moment, just assume the max group size
-    // const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
-
-    // for (uint32_t i = 0; i < numGeometry; ++i) {
-    //   GeomType *geomType = geometry[i]->geomType;
-
-    //   if (geomType->getKind() == GPRT_TRIANGLES) {
-    //     TriangleGeom *geom = (TriangleGeom *) geometry[i];
-    //     VkDeviceSize offsets[1] = {0};
-
-    //     uint32_t instanceCount = 1;
-    //     if (instanceCounts != nullptr) {
-    //       instanceCount = instanceCounts[i];
-    //     }
-
-    //     std::vector<VkDescriptorSet> descriptorSets = {samplerDescriptorSet, texture1DDescriptorSet,
-    //                                                    texture2DDescriptorSet, texture3DDescriptorSet,
-    //                                                    rasterRecordDescriptorSet};
-
-    //     uint32_t offset = geom->address * recordSize;
-    //     vkCmdBindDescriptorSets(graphicsCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-    //                             geomType->raster[rasterType].pipelineLayout, 0, descriptorSets.size(),
-    //                             descriptorSets.data(), 1, &offset);
-    //     vkCmdBindIndexBuffer(graphicsCommandBuffer, geom->index.buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
-    //     vkCmdDrawIndexed(graphicsCommandBuffer, geom->index.count * 3, instanceCount, 0, 0, 0);
-    //   }
-    // }
 
     vkCmdEndRenderPass(graphicsCommandBuffer);
 
@@ -6941,8 +7020,11 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
   const uint32_t groupAlignment = rayTracingPipelineProperties.shaderGroupHandleAlignment;
   const uint32_t maxShaderRecordStride = rayTracingPipelineProperties.maxShaderGroupStride;
 
-  // for the moment, just assume the max group size
-  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+  if (requestedFeatures.recordSize > maxGroupSize) {
+    LOG_ERROR("Requested record size is too large! Max record size for this platform is " + std::to_string(maxGroupSize) + " bytes.");
+  }
+
+  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
 
   // Check here to confirm we really do have ray tracing programs. With raster support, sometimes
   // we might only have raster programs, and no RT programs.
@@ -6984,6 +7066,7 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
                                 rayTracingPipelineProperties.shaderGroupBaseAlignment);
     }
 
+    // allocate / resize miss table
     size_t numMissProgs = missPrograms.size();
     if (missTable && missTable->size != recordSize * numMissProgs) {
       missTable->destroy();
@@ -6996,6 +7079,20 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
                               rayTracingPipelineProperties.shaderGroupBaseAlignment);
     }
 
+    // allocate / resize callable table
+    size_t numCallableProgs = callablePrograms.size();
+    if (callableTable && callableTable->size != recordSize * numCallableProgs) {
+      callableTable->destroy();
+      delete callableTable;
+      callableTable = nullptr;
+    }
+    if (!callableTable && callablePrograms.size() > 0) {
+      callableTable = new Buffer(physicalDevice, logicalDevice, allocator, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                              bufferUsageFlags, memoryUsageFlags, recordSize * numCallableProgs,
+                              rayTracingPipelineProperties.shaderGroupBaseAlignment);
+    }
+
+    // allocate / resize hit group table
     size_t numHitRecords = getNumHitRecords();
     if (hitgroupTable && hitgroupTable->size != recordSize * numHitRecords) {
       hitgroupTable->destroy();
@@ -7007,19 +7104,6 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
                                   bufferUsageFlags, memoryUsageFlags, recordSize * numHitRecords,
                                   rayTracingPipelineProperties.shaderGroupBaseAlignment);
     }
-
-    size_t numRecords = numRayGens + numMissProgs + numHitRecords;
-
-    // if (shaderBindingTable.size != recordSize * numRecords) {
-    //   shaderBindingTable.destroy();
-    // }
-    // if (shaderBindingTable.buffer == VK_NULL_HANDLE) {
-    //   shaderBindingTable = Buffer(physicalDevice, logicalDevice, VK_NULL_HANDLE, VK_NULL_HANDLE, bufferUsageFlags,
-    //                               memoryUsageFlags, recordSize * numRecords);
-    // }
-
-    // shaderBindingTable.map();
-    // uint8_t *mapped = ((uint8_t *) (shaderBindingTable.mapped));
 
     // Raygen records
     if ((flags & GPRTBuildSBTFlags::GPRT_SBT_RAYGEN) != 0 && raygenPrograms.size() > 0) {
@@ -7068,6 +7152,30 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
       missTable->unmap();
     }
 
+    // Callable records
+    if ((flags & GPRTBuildSBTFlags::GPRT_SBT_CALLABLE) != 0 && callablePrograms.size() > 0) {
+      callableTable->map();
+      uint8_t *mapped = ((uint8_t *) (callableTable->mapped));
+
+      for (uint32_t idx = 0; idx < callablePrograms.size(); ++idx) {
+        size_t recordStride = recordSize;
+        size_t handleStride = handleSize;
+
+        // First, copy handle
+        size_t recordOffset = recordStride * idx;   // + recordStride * numRayGens;
+        size_t handleOffset = handleStride * idx + handleStride * (numRayGens + numMissProgs);
+        memcpy(mapped + recordOffset, shaderHandleStorage.data() + handleOffset, handleSize);
+
+        // Then, copy params following handle
+        recordOffset = recordOffset + handleSize;
+        uint8_t *params = mapped + recordOffset;
+        Callable *callable = callablePrograms[idx];
+        memcpy(params, callable->SBTRecord, callable->recordSize);
+      }
+
+      callableTable->unmap();
+    }
+
     // Hit records
     if ((flags & GPRTBuildSBTFlags::GPRT_SBT_HITGROUP) != 0 && numHitRecords > 0) {
       hitgroupTable->map();
@@ -7108,7 +7216,7 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
                   // recordStride * (numRayGens + numMissProgs);
                   size_t handleOffset =
                       handleStride * (rayType + requestedFeatures.numRayTypes * geomID + instanceOffset) +
-                      handleStride * (numRayGens + numMissProgs);
+                      handleStride * (numRayGens + numMissProgs + numCallableProgs);
                   memcpy(mapped + recordOffset, shaderHandleStorage.data() + handleOffset, handleSize);
 
                   // Then, copy params following handle
@@ -7139,7 +7247,7 @@ void Context::buildSBT(GPRTBuildSBTFlags flags) {
                   // + recordStride * (numRayGens + numMissProgs);
                   size_t handleOffset =
                       handleStride * (rayType + requestedFeatures.numRayTypes * geomID + instanceOffset) +
-                      handleStride * (numRayGens + numMissProgs);
+                      handleStride * (numRayGens + numMissProgs + numCallableProgs);
                   memcpy(mapped + recordOffset, shaderHandleStorage.data() + handleOffset, handleSize);
 
                   // Then, copy params following handle
@@ -7216,7 +7324,8 @@ void Context::buildPipeline() {
     binding.binding = 0;
     binding.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR | 
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                           VK_SHADER_STAGE_COMPUTE_BIT;
 
     std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {binding};
@@ -7319,7 +7428,8 @@ void Context::buildPipeline() {
     binding.binding = 0;
     binding.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR | 
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                           VK_SHADER_STAGE_COMPUTE_BIT;
 
     std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {binding};
@@ -7427,7 +7537,8 @@ void Context::buildPipeline() {
     binding.binding = 0;
     binding.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR | 
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                           VK_SHADER_STAGE_COMPUTE_BIT;
 
     std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {binding};
@@ -7535,7 +7646,8 @@ void Context::buildPipeline() {
     binding.binding = 0;
     binding.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR | 
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                           VK_SHADER_STAGE_COMPUTE_BIT;
 
     std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {binding};
@@ -7643,7 +7755,8 @@ void Context::buildPipeline() {
     binding.binding = 0;
     binding.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR | 
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                           VK_SHADER_STAGE_COMPUTE_BIT;
 
     std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {binding};
@@ -7747,7 +7860,7 @@ void Context::buildPipeline() {
     const VkMemoryPropertyFlags memoryUsageFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;   // means most efficient for
                                                                                           // device access
 
-    // for the moment, just assume the max group size
+
     auto alignedSize = [](uint32_t value, uint32_t alignment) -> uint32_t {
       return (value + alignment - 1) & ~(alignment - 1);
     };
@@ -7756,7 +7869,7 @@ void Context::buildPipeline() {
 
     const uint32_t maxGroupSize = rayTracingPipelineProperties.maxShaderGroupStride;
     const uint32_t groupAlignment = rayTracingPipelineProperties.shaderGroupHandleAlignment;
-    const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+    const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
 
     rasterRecordBuffer =
         new Buffer(physicalDevice, logicalDevice, allocator, graphicsCommandBuffer, graphicsQueue, bufferUsageFlags,
@@ -7815,7 +7928,7 @@ void Context::buildPipeline() {
     const VkMemoryPropertyFlags memoryUsageFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;   // means most efficient for
                                                                                           // device access
 
-    // for the moment, just assume the max group size
+
     auto alignedSize = [](uint32_t value, uint32_t alignment) -> uint32_t {
       return (value + alignment - 1) & ~(alignment - 1);
     };
@@ -7824,7 +7937,7 @@ void Context::buildPipeline() {
 
     const uint32_t maxGroupSize = rayTracingPipelineProperties.maxShaderGroupStride;
     const uint32_t groupAlignment = rayTracingPipelineProperties.shaderGroupHandleAlignment;
-    const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+    const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
 
     computeRecordBuffer =
         new Buffer(physicalDevice, logicalDevice, allocator, graphicsCommandBuffer, graphicsQueue, bufferUsageFlags,
@@ -7867,7 +7980,7 @@ void Context::buildPipeline() {
     pushConstantRange.offset = 0;
     pushConstantRange.stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                                     VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                                    VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+                                    VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
     VkPipelineLayoutCreateInfo pipelineLayoutCI{};
     pipelineLayoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -7908,10 +8021,25 @@ void Context::buildPipeline() {
       }
     }
 
-    // Miss group
+    // Miss groups
     {
       for (auto miss : missPrograms) {
         shaderStages.push_back(miss->shaderStage);
+        VkRayTracingShaderGroupCreateInfoKHR shaderGroup{};
+        shaderGroup.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        shaderGroup.generalShader = static_cast<uint32_t>(shaderStages.size()) - 1;
+        shaderGroup.closestHitShader = VK_SHADER_UNUSED_KHR;
+        shaderGroup.anyHitShader = VK_SHADER_UNUSED_KHR;
+        shaderGroup.intersectionShader = VK_SHADER_UNUSED_KHR;
+        shaderGroups.push_back(shaderGroup);
+      }
+    }
+
+    // Callable groups
+    {
+      for (auto callable : callablePrograms) {
+        shaderStages.push_back(callable->shaderStage);
         VkRayTracingShaderGroupCreateInfoKHR shaderGroup{};
         shaderGroup.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
         shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
@@ -8021,8 +8149,10 @@ void Context::buildPipeline() {
       rayTracingPipelineCI.pStages = shaderStages.data();
       rayTracingPipelineCI.groupCount = static_cast<uint32_t>(shaderGroups.size());
       rayTracingPipelineCI.pGroups = shaderGroups.data();
-      rayTracingPipelineCI.maxPipelineRayRecursionDepth = 1;   // WHA!?
+      rayTracingPipelineCI.maxPipelineRayRecursionDepth = requestedFeatures.rayRecursionDepth;
       rayTracingPipelineCI.layout = raytracingPipelineLayout;
+
+      LOG_INFO("Creating VkRayTracingPipelineCreateInfoKHR with max recursion depth of " + std::to_string(requestedFeatures.rayRecursionDepth) + ".");
 
       if (raytracingPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(logicalDevice, raytracingPipeline, nullptr);
@@ -8086,6 +8216,18 @@ GPRT_API void
 gprtRequestRayQueries() {
   LOG_API_CALL();
   requestedFeatures.rayQueries = true;
+}
+
+GPRT_API void
+gprtRequestRayRecursionDepth(uint32_t rayRecursionDepth) {
+  LOG_API_CALL();
+  requestedFeatures.rayRecursionDepth = rayRecursionDepth;
+}
+
+GPRT_API void 
+gprtRequestRecordSize(uint32_t recordSize) {
+  LOG_API_CALL();
+  requestedFeatures.recordSize = recordSize;
 }
 
 GPRT_API bool
@@ -8648,8 +8790,7 @@ gprtGeomTypeRasterize(GPRTContext _context, GPRTGeomType _geomType, uint32_t num
   const uint32_t groupAlignment = context->rayTracingPipelineProperties.shaderGroupHandleAlignment;
   const uint32_t maxShaderRecordStride = context->rayTracingPipelineProperties.maxShaderGroupStride;
 
-  // for the moment, just assume the max group size
-  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
 
   for (uint32_t i = 0; i < numGeometry; ++i) {
     GeomType *geomType = geometry[i]->geomType;
@@ -8800,6 +8941,10 @@ gprtRayGenCreate(GPRTContext _context, GPRTModule _module, const char *programNa
   Context *context = (Context *) _context;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(programName)) {
+    LOG_ERROR("RayGen program " + std::string(programName) + " not found in module!");
+  }
+
   RayGen *raygen = new RayGen(context->logicalDevice, module, programName, recordSize);
 
   context->raygenPrograms.push_back(raygen);
@@ -8808,6 +8953,11 @@ gprtRayGenCreate(GPRTContext _context, GPRTModule _module, const char *programNa
   context->raytracingPipelineOutOfDate = true;
 
   return (GPRTRayGen) raygen;
+}
+
+template <>
+GPRTRayGenOf<void> gprtRayGenCreate<void>(GPRTContext _context, GPRTModule _module, const char *programName) {
+  return (GPRTRayGenOf<void>) gprtRayGenCreate(_context, _module, programName, 0);
 }
 
 GPRT_API void
@@ -8841,6 +8991,10 @@ GPRTCompute gprtComputeCreate(GPRTContext _context, GPRTModule _module, const ch
   Context *context = (Context *) _context;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(programName)) {
+    LOG_ERROR("Compute program " + std::string(programName) + " not found in module!");
+  }
+
   Compute *compute = new Compute(context, context->logicalDevice, module, programName, 0);
 
   // Notify context that we need to build this compute pipeline
@@ -8864,6 +9018,10 @@ gprtMissCreate(GPRTContext _context, GPRTModule _module, const char *programName
   Context *context = (Context *) _context;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(programName)) {
+    LOG_ERROR("Miss program " + std::string(programName) + " not found in module!");
+  }
+
   Miss *missProg = new Miss(context->logicalDevice, module, programName, recordSize);
 
   context->missPrograms.push_back(missProg);
@@ -8872,6 +9030,11 @@ gprtMissCreate(GPRTContext _context, GPRTModule _module, const char *programName
   context->raytracingPipelineOutOfDate = true;
 
   return (GPRTMiss) missProg;
+}
+
+template <>
+GPRTMissOf<void> gprtMissCreate<void>(GPRTContext _context, GPRTModule _module, const char *programName) {
+  return (GPRTMissOf<void>) gprtMissCreate(_context, _module, programName, 0);
 }
 
 /*! sets the given miss program for the given ray type */
@@ -8903,6 +9066,62 @@ gprtMissSetParameters(GPRTMiss _miss, void *parameters, int deviceID) {
   LOG_API_CALL();
   Miss *miss = (Miss *) _miss;
   memcpy(miss->SBTRecord, parameters, miss->recordSize);
+}
+
+GPRT_API GPRTCallable
+gprtCallableCreate(GPRTContext _context, GPRTModule _module, const char *programName, size_t recordSize) {
+  LOG_API_CALL();
+  Context *context = (Context *) _context;
+  Module *module = (Module *) _module;
+
+  if (!module->checkForEntrypoint(programName)) {
+    LOG_ERROR("Callable program " + std::string(programName) + " not found in module!");
+  }
+
+  Callable *callableProg = new Callable(context->logicalDevice, module, programName, recordSize);
+
+  context->callablePrograms.push_back(callableProg);
+
+  // Creating a callable program requires rebuilding a RT pipeline.
+  context->raytracingPipelineOutOfDate = true;
+
+  return (GPRTCallable) callableProg;
+}
+
+template <>
+GPRTCallableOf<void> gprtCallableCreate<void>(GPRTContext _context, GPRTModule _module, const char *programName) {
+  return (GPRTCallableOf<void>) gprtCallableCreate(_context, _module, programName, 0);
+}
+
+/*! sets the given callable program for the given ray type */
+GPRT_API void
+gprtCallableSet(GPRTContext _context, int rayType, GPRTCallable _callableToUse) {
+  GPRT_NOTIMPLEMENTED;
+}
+
+GPRT_API void
+gprtCallableDestroy(GPRTCallable _callable) {
+  LOG_API_CALL();
+  Callable *callableProg = (Callable *) _callable;
+  callableProg->destroy();
+  delete callableProg;
+  callableProg = nullptr;
+
+  // todo, update context->callablePrograms list... rebuild pipelines
+}
+
+GPRT_API void *
+gprtCallableGetParameters(GPRTCallable _callable, int deviceID) {
+  LOG_API_CALL();
+  Callable *callable = (Callable *) _callable;
+  return callable->SBTRecord;
+}
+
+GPRT_API void
+gprtCallableSetParameters(GPRTCallable _callable, void *parameters, int deviceID) {
+  LOG_API_CALL();
+  Callable *callable = (Callable *) _callable;
+  memcpy(callable->SBTRecord, parameters, callable->recordSize);
 }
 
 GPRT_API GPRTGeomType
@@ -8947,6 +9166,10 @@ gprtGeomTypeSetClosestHitProg(GPRTGeomType _geomType, int rayType, GPRTModule _m
   GeomType *geomType = (GeomType *) _geomType;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(progName)) {
+    LOG_ERROR("ClosestHit program " + std::string(progName) + " not found in module!");
+  }
+
   geomType->setClosestHit(rayType, module, progName);
 }
 
@@ -8955,6 +9178,10 @@ gprtGeomTypeSetAnyHitProg(GPRTGeomType _geomType, int rayType, GPRTModule _modul
   LOG_API_CALL();
   GeomType *geomType = (GeomType *) _geomType;
   Module *module = (Module *) _module;
+
+  if (!module->checkForEntrypoint(progName)) {
+    LOG_ERROR("AnyHit program " + std::string(progName) + " not found in module!");
+  }
 
   geomType->setAnyHit(rayType, module, progName);
 }
@@ -8965,6 +9192,10 @@ gprtGeomTypeSetIntersectionProg(GPRTGeomType _geomType, int rayType, GPRTModule 
   GeomType *geomType = (GeomType *) _geomType;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(progName)) {
+    LOG_ERROR("Intersection program " + std::string(progName) + " not found in module!");
+  }
+
   geomType->setIntersection(rayType, module, progName);
 }
 
@@ -8974,6 +9205,10 @@ gprtGeomTypeSetVertexProg(GPRTGeomType _geomType, int rasterType, GPRTModule _mo
   GeomType *geomType = (GeomType *) _geomType;
   Module *module = (Module *) _module;
 
+  if (!module->checkForEntrypoint(progName)) {
+    LOG_ERROR("Vertex program " + std::string(progName) + " not found in module!");
+  }
+
   geomType->setVertex(rasterType, module, progName);
 }
 
@@ -8982,6 +9217,10 @@ gprtGeomTypeSetPixelProg(GPRTGeomType _geomType, int rasterType, GPRTModule _mod
   LOG_API_CALL();
   GeomType *geomType = (GeomType *) _geomType;
   Module *module = (Module *) _module;
+
+  if (!module->checkForEntrypoint(progName)) {
+    LOG_ERROR("Pixel program " + std::string(progName) + " not found in module!");
+  }
 
   geomType->setPixel(rasterType, module, progName);
 }
@@ -9658,7 +9897,7 @@ GPRT_API gprt::Buffer
 gprtBufferGetHandle(GPRTBuffer _buffer, int deviceID) {
   LOG_API_CALL();
   Buffer *buffer = (Buffer *) _buffer;
-  return gprt::Buffer{buffer->deviceAddress, buffer->virtualAddress};
+  return gprt::Buffer{buffer->virtualAddress, 0};
 }
 
 GPRT_API void
@@ -9822,7 +10061,7 @@ gprtAccelGetSize(GPRTAccel _accel, int deviceID) {
 GPRT_API gprt::Accel
 gprtAccelGetHandle(GPRTAccel _accel, int deviceID) {
   Accel *accel = (Accel *) _accel;
-  return {accel->address, /* unused */ 0};
+  return {accel->address};
 }
 
 GPRT_API void
@@ -9876,9 +10115,9 @@ gprtRayGenLaunch3D(GPRTContext _context, GPRTRayGen _rayGen, uint32_t dims_x, ui
   if (pushConstantsSize > 0) {
     if (pushConstantsSize > 128) LOG_ERROR("Push constants size exceeds maximum 128 byte limit!");
     vkCmdPushConstants(context->graphicsCommandBuffer, context->raytracingPipelineLayout,
-                      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
-                          VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                          VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+                        VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+                        VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+                        VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR,
                       0, pushConstantsSize, pushConstants);
   }
 
@@ -9898,11 +10137,12 @@ gprtRayGenLaunch3D(GPRTContext _context, GPRTRayGen _rayGen, uint32_t dims_x, ui
   const uint32_t groupAlignment = context->rayTracingPipelineProperties.shaderGroupHandleAlignment;
   const uint32_t maxShaderRecordStride = context->rayTracingPipelineProperties.maxShaderGroupStride;
 
-  // for the moment, just assume the max group size
-  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
   uint64_t raygenBaseAddr = getBufferDeviceAddress(context->logicalDevice, context->raygenTable->buffer);
   uint64_t missBaseAddr =
       (context->missTable) ? getBufferDeviceAddress(context->logicalDevice, context->missTable->buffer) : 0;
+  uint64_t callableBaseAddr =
+      (context->callableTable) ? getBufferDeviceAddress(context->logicalDevice, context->callableTable->buffer) : 0;
   uint64_t hitgroupBaseAddr =
       (context->hitgroupTable) ? getBufferDeviceAddress(context->logicalDevice, context->hitgroupTable->buffer) : 0;
 
@@ -9924,23 +10164,25 @@ gprtRayGenLaunch3D(GPRTContext _context, GPRTRayGen _rayGen, uint32_t dims_x, ui
 
   VkStridedDeviceAddressRegionKHR missShaderSbtEntry{};
   if (context->missPrograms.size() > 0) {
-    missShaderSbtEntry.deviceAddress = missBaseAddr;   // baseAddr + recordSize * context->raygenPrograms.size();
+    missShaderSbtEntry.deviceAddress = missBaseAddr;
     missShaderSbtEntry.stride = recordSize;
     missShaderSbtEntry.size = missShaderSbtEntry.stride * context->missPrograms.size();
   }
+
+  VkStridedDeviceAddressRegionKHR callableShaderSbtEntry{};
+  if (context->callablePrograms.size() > 0) {
+    callableShaderSbtEntry.deviceAddress = callableBaseAddr;
+    callableShaderSbtEntry.stride = recordSize;
+    callableShaderSbtEntry.size = callableShaderSbtEntry.stride * context->callablePrograms.size();
+  }
+
   VkStridedDeviceAddressRegionKHR hitShaderSbtEntry{};
   size_t numHitRecords = context->getNumHitRecords();
   if (numHitRecords > 0) {
     hitShaderSbtEntry.deviceAddress = hitgroupBaseAddr;
-    // baseAddr + recordSize * (context->raygenPrograms.size() + context->missPrograms.size());
     hitShaderSbtEntry.stride = recordSize;
     hitShaderSbtEntry.size = hitShaderSbtEntry.stride * numHitRecords;
   }
-
-  VkStridedDeviceAddressRegionKHR callableShaderSbtEntry{};   // empty
-  callableShaderSbtEntry.deviceAddress = 0;
-  // callableShaderSbtEntry.stride = handleSizeAligned;
-  // callableShaderSbtEntry.size = handleSizeAligned;
 
   gprt::vkCmdTraceRays(context->graphicsCommandBuffer, &raygenShaderSbtEntry, &missShaderSbtEntry, &hitShaderSbtEntry,
                        &callableShaderSbtEntry, dims_x, dims_y, dims_z);
@@ -9972,7 +10214,7 @@ gprtRayGenLaunch3D(GPRTContext _context, GPRTRayGen _rayGen, uint32_t dims_x, ui
     LOG_ERROR("failed to wait for queue idle! : \n" + errorString(err));
 }
 
-void _gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTCompute _compute, std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants) {
+void _gprtComputeLaunch(GPRTCompute _compute, std::array<size_t, 3> numGroups, std::array<size_t, 3> groupSize, std::array<char, PUSH_CONSTANTS_LIMIT> pushConstants) {
   Compute *compute = (Compute *) _compute;
   Context *context = compute->context;
   VkResult err;
@@ -10002,8 +10244,7 @@ void _gprtComputeLaunch(std::array<size_t, 3> numGroups, GPRTCompute _compute, s
                                                 context->texture1DDescriptorSet, context->texture2DDescriptorSet, 
                                                 context->texture3DDescriptorSet, context->bufferDescriptorSet};
 
-  // for the moment, just assume the max group size
-  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, uint32_t(4096)), groupAlignment);
+  const uint32_t recordSize = alignedSize(std::min(maxGroupSize, requestedFeatures.recordSize), groupAlignment);
   uint32_t offset = (uint32_t)compute->address * recordSize;
   vkCmdBindDescriptorSets(context->graphicsCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute->pipelineLayout, 0,
                           (uint32_t)descriptorSets.size(), descriptorSets.data(), 1, &offset);
