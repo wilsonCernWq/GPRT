@@ -99,6 +99,7 @@ function(embed_devicecode)
   unset(EMBED_DEVICECODE_OUTPUTS)
 
   add_custom_command(
+  # add_custom_target(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${EMBED_DEVICECODE_OUTPUT_TARGET}.spv
     COMMAND ${CMAKE_SLANG_COMPILER}
     ${EMBED_DEVICECODE_SOURCES}
