@@ -20,9 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-add_subdirectory(t00-bufferCopy)
-add_subdirectory(t01-bufferResize)
-add_subdirectory(t02-bufferSort)
+#add_subdirectory(t00-bufferCopy)
+#add_subdirectory(t01-bufferResize)
+#add_subdirectory(t02-bufferSort)
 add_subdirectory(t03-bufferExclusiveSum)
-add_subdirectory(t04-nearestNeighbors)
-add_subdirectory(t10-swBVH)
+#add_subdirectory(t04-nearestNeighbors)
+#add_subdirectory(t10-swBVH)

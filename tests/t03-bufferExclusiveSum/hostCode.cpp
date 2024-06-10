@@ -24,6 +24,12 @@
 #include <iostream>
 #include <stdexcept>
 #include <chrono>
+#include <cstring>
+
+/*
+ * EXCLUSIVE SUM := prefix sum excluding the element at the index
+ * i.e. 
+ */
 
 int
 main(int ac, char **av) {
@@ -46,7 +52,7 @@ main(int ac, char **av) {
 
     // Act
     // std::cout<<"Computing exclusive sum on device" << std::endl;
-    uint32_t total = gprtBufferExclusiveSum(context, data, exclusiveSum, scratch);
+    uint32_t total = gprtBufferExclusiveSum(context, data /* input data */, exclusiveSum /* exclusive sum output */, scratch /* scratch paper for the algorithm? */); // this line just runs the exclusive sum
     // std::cout<<"Done! Total is " << total <<std::endl;
 
     // std::cout<<"Computing exclusive sum on host" << std::endl;
